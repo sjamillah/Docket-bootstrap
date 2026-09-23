@@ -1,0 +1,22 @@
+# Git sync adopts the existing stack rather than creating a second one, so
+# these must match what the first hand-run deploy used.
+template-file-path: bootstrap.yaml
+
+parameters:
+  ProjectName: docket
+  GitHubOrg: sjamillah
+  GitHubInfraRepo: Docket-infra
+  GitHubBranch: main
+  # false when the account already has the provider. It is account-global.
+  CreateOidcProvider: 'false'
+  # The only two account-specific values in the project. Everything else
+  # resolves from what this stack publishes to Parameter Store.
+  AlertEmail: jamillah.ssozi@amalitech.com
+  S3PrefixListId: pl-REPLACE-ME
+
+tags:
+  Project: docket
+  Environment: dev
+  Owner: jamillah.ssozi
+  ManagedBy: cloudformation-gitsync
+  CostCentre: training
