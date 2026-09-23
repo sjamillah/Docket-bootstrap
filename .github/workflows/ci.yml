@@ -1,15 +1,12 @@
 name: CI
 
 on:
-  pull_request:
   push:
     branches: [main]
     paths-ignore:
       - '**.md'
   workflow_dispatch:
 
-# Nothing here talks to AWS. Git sync deploys the template; this only checks
-# that what you pushed is valid before it does.
 permissions:
   contents: read
 
@@ -21,13 +18,22 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
+          # Keyed on requirements.txt, so cfn-lint comes from cache.
           cache: pip
 
-      - run: pip install -r requirements.txt
-      - run: make lint
+      - name: Install
+        run: pip install -r requirements.txt
+
+      # One flat template with no children, so there is nothing to package.
+      # Git sync deploys it; this only checks it is valid before that.
+      - name: Lint
+        run: make lint
