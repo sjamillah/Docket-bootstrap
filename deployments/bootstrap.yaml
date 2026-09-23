@@ -6,13 +6,13 @@ parameters:
   ProjectName: docket
   GitHubOrg: sjamillah
   GitHubInfraRepo: Docket-infra
+  GitHubAppRepo: Docket-app
   GitHubBranch: main
   # false when the account already has the provider. It is account-global.
   CreateOidcProvider: 'false'
-  # The only two account-specific values in the project. Everything else
-  # resolves from what this stack publishes to Parameter Store.
+  # The only value in the project that is not either derived or a resource
+  # identifier. The S3 prefix list is looked up by the stack, not typed here.
   AlertEmail: jamillah.ssozi@amalitech.com
-  S3PrefixListId: pl-REPLACE-ME
 
 tags:
   Project: docket

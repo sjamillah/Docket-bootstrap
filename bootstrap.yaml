@@ -23,6 +23,10 @@ Parameters:
     Type: String
     Default: Docket-infra
 
+  GitHubAppRepo:
+    Type: String
+    Default: Docket-app
+
   GitHubBranch:
     Type: String
     Default: main
@@ -37,15 +41,6 @@ Parameters:
     Description: >-
       Where CloudWatch alarms are delivered. Published to Parameter Store so
       the main stack resolves it rather than carrying an address in git.
-
-  S3PrefixListId:
-    Type: String
-    AllowedPattern: '^pl-[0-9a-f]+$'
-    ConstraintDescription: A managed prefix list id, for example pl-63a5400a.
-    Description: >-
-      Assigned by AWS per region and returned by no resource, so it is entered
-      once here and published. Find it with describe-prefix-lists, filtering
-      prefix-list-name on com.amazonaws.<region>.s3.
 
   CreateOidcProvider:
     Type: String
@@ -177,6 +172,73 @@ Resources:
                 Action: 'ssm:GetParameter'
                 Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/template-bucket'
 
+  # Sibling of GitHubInfraRole above: both are CI identity, so both live here
+  # rather than in the stack they happen to grant access to. Everything it
+  # names is derived from ProjectName, so this has no dependency on the main
+  # stack and can be created before ECR or the artifact bucket exist.
+  GitHubAppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-gha-app'
+      Description: GitHub Actions in the application repo, pushing images and deploy config
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - NeedsOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+              StringLike:
+                # GitHub appends numeric ids on rename; the literal @ anchors it.
+                'token.actions.githubusercontent.com:sub':
+                  - !Sub 'repo:${GitHubOrg}/${GitHubAppRepo}:ref:refs/heads/${GitHubBranch}'
+                  - !Sub 'repo:${GitHubOrg}@*/${GitHubAppRepo}@*:ref:refs/heads/${GitHubBranch}'
+      Policies:
+        - PolicyName: ecr-push
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AuthTokenIsAccountWide
+                Effect: Allow
+                Action: 'ecr:GetAuthorizationToken'
+                Resource: '*'
+              - Sid: PushToThisRepositoryOnly
+                Effect: Allow
+                Action:
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:InitiateLayerUpload'
+                  - 'ecr:UploadLayerPart'
+                  - 'ecr:CompleteLayerUpload'
+                  - 'ecr:PutImage'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:GetDownloadUrlForLayer'
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ProjectName}'
+
+        - PolicyName: publish-deploy-config
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # taskdef.json and appspec.yaml, zipped. The pipeline reads this
+              # object; the app repo is the only thing that writes it.
+              - Sid: UploadDeployConfig
+                Effect: Allow
+                Action: 's3:PutObject'
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}/config/*'
+
+              # Everything the workflow renders into taskdef.json, published
+              # by whichever stack creates the thing it names.
+              - Sid: ResolvePublishedNames
+                Effect: Allow
+                Action: 'ssm:GetParameter'
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*'
+
   # Assumed by CloudFormation to build the stacks. Nothing else can use it.
   CfnDeploymentRole:
     Type: AWS::IAM::Role
@@ -207,6 +269,7 @@ Resources:
                 Action:
                   - 'ec2:*'
                   - 'ecs:*'
+                  - 'lambda:*'
                   - 'ecr:*'
                   - 'elasticloadbalancing:*'
                   - 'rds:*'
@@ -399,18 +462,101 @@ Resources:
                   StringEquals:
                     'iam:PassedToService': cloudformation.amazonaws.com
 
+  # --- S3 prefix list -------------------------------------------------------
+
+  # The S3 gateway endpoint is reached over the route table rather than an ENI,
+  # so egress to it can only be expressed as a prefix list. AWS assigns the id
+  # per region and no resource returns it, which is why it used to be typed
+  # into a deployment file. Looking it up removes the last value anyone had to
+  # find by hand.
+
+  PrefixListLookupLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-prefix-list-lookup'
+      RetentionInDays: 7
+
+  PrefixListLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-prefix-list-lookup'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: describe-prefix-lists
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read-only, and the only call this function makes.
+              - Effect: Allow
+                Action: 'ec2:DescribeManagedPrefixLists'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !GetAtt PrefixListLookupLogGroup.Arn
+
+  PrefixListLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-prefix-list-lookup'
+      Description: Resolves this region's S3 gateway endpoint prefix list id
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt PrefixListLookupRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref PrefixListLookupLogGroup
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              # Nothing is created, so there is nothing to undo.
+              if event["RequestType"] == "Delete":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              try:
+                  region = event["ResourceProperties"]["Region"]
+                  name = "com.amazonaws." + region + ".s3"
+                  found = boto3.client("ec2").describe_managed_prefix_lists(
+                      Filters=[{"Name": "prefix-list-name", "Values": [name]}]
+                  )["PrefixLists"]
+                  if not found:
+                      raise RuntimeError("no managed prefix list named " + name)
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.SUCCESS,
+                      {"PrefixListId": found[0]["PrefixListId"]},
+                      physicalResourceId=name,
+                  )
+              except Exception as exc:
+                  # Without this a failure hangs the stack for an hour.
+                  cfnresponse.send(
+                      event, context, cfnresponse.FAILED, {}, reason=str(exc)
+                  )
+
+  S3PrefixList:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt PrefixListLookupFunction.Arn
+      # Present so a region change re-runs the lookup instead of reusing it.
+      Region: !Ref AWS::Region
+
   # --- Published for the main stack and CI ----------------------------------
 
   # Every value below is read with {{resolve:ssm}} or AWS::SSM::Parameter::Value
   # rather than pasted into a console or a workflow secret. The stack that
   # creates the resource is the stack that publishes its identifier.
-
-  GitHubOrgParameter:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub '/${ProjectName}/github-org'
-      Type: String
-      Value: !Ref GitHubOrg
 
   AlertEmailParameter:
     Type: AWS::SSM::Parameter
@@ -424,7 +570,14 @@ Resources:
     Properties:
       Name: !Sub '/${ProjectName}/s3-prefix-list-id'
       Type: String
-      Value: !Ref S3PrefixListId
+      Value: !GetAtt S3PrefixList.PrefixListId
+
+  GitHubAppRoleArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/gha-app-role-arn'
+      Type: String
+      Value: !GetAtt GitHubAppRole.Arn
 
   GitHubInfraRoleArnParameter:
     Type: AWS::SSM::Parameter
@@ -454,6 +607,10 @@ Outputs:
   GitHubInfraRoleArn:
     Description: Set as secret AWS_ROLE_ARN in the infrastructure repository
     Value: !GetAtt GitHubInfraRole.Arn
+
+  GitHubAppRoleArn:
+    Description: Set as secret AWS_ROLE_ARN in the application repository
+    Value: !GetAtt GitHubAppRole.Arn
 
   CfnDeploymentRoleArn:
     Description: Nominate as the stack operations role when configuring Git sync
